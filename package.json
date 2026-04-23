@@ -1,0 +1,53 @@
+{
+  "name": "@geoclear/verify-receipt",
+  "version": "1.0.0",
+  "description": "Verify GeoClear signed decision receipts offline. Proves what GeoClear returned at what moment, without calling GeoClear.",
+  "type": "commonjs",
+  "main": "src/verify.js",
+  "exports": {
+    ".": {
+      "require": "./src/verify.js",
+      "types": "./src/verify.d.ts"
+    }
+  },
+  "files": [
+    "src/",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md"
+  ],
+  "scripts": {
+    "test": "vitest run"
+  },
+  "keywords": [
+    "geoclear",
+    "signed-receipts",
+    "jws",
+    "ecdsa",
+    "audit-trail",
+    "address-api",
+    "cryptographic-attestation"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/shaileshjgd/geoclear-verify-receipt.git"
+  },
+  "homepage": "https://geoclear.io/security#receipt-demo",
+  "bugs": {
+    "url": "https://github.com/shaileshjgd/geoclear-verify-receipt/issues"
+  },
+  "author": "Auduu Inc <hello@geoclear.io>",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "jose": "^5.0.0"
+  },
+  "devDependencies": {
+    "vitest": "^2.0.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}
