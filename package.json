@@ -1,7 +1,7 @@
 {
   "name": "@geoclear/verify-receipt",
-  "version": "1.0.0",
-  "description": "Verify GeoClear signed decision receipts offline. Proves what GeoClear returned at what moment, without calling GeoClear.",
+  "version": "1.1.0",
+  "description": "Verify GeoClear signed decision receipts offline. Proves what GeoClear returned at what moment, without calling GeoClear. v1.1.0 adds hardware-attested identity gates (signing account / region / instance / PCR0).",
   "type": "commonjs",
   "main": "src/verify.js",
   "exports": {

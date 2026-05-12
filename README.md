@@ -4,9 +4,9 @@
 > calling GeoClear servers.** Proves to a regulator years from now exactly
 > what GeoClear returned at exactly what moment.
 
-**Status (2026-04-23):** local prototype — not yet published. Public release
-pending internal security review + legal review of the "attestation" claim.
-Issue tracking: Q-382 Phase 2.8.
+**v1.1.0** — Adds support for fact-witness Nitro Enclave receipts and
+hardware-attested-identity gates (`expectedAccountId`, `expectedRegion`,
+`expectedInstanceId`, `expectedPcr0`). See [CHANGELOG](./CHANGELOG.md).
 
 ## What a signed receipt is
 
@@ -138,6 +138,60 @@ async function verify(receipt, method, path, reqBody, respBody) {
 }
 </script>
 ```
+
+## v1.1.0 — Fact-witness enclave receipts + strict identity gates
+
+When a receipt was produced by GeoClear's sovereign-decision-environment
+pipeline (a fact-witness Nitro Enclave), the JWS payload carries four
+additional claims that bind the signature to the physical signing host:
+
+```json
+{
+  "iss": "https://geoclear.io",
+  "iat": 1779408000,
+  "sub": "<request-id>",
+  "resp_hash": "sha256:<JCS-canonical-SHA-256 of the decision payload>",
+  "payload_size": 1220,
+  "signing_account_id": "769533384420",
+  "signing_region": "us-east-1",
+  "signing_instance_id": "i-095d3b347ed8703e5",
+  "pcr0": "98fc045975c7b9a58cf2fcd89ae7804d8e06d8b31c5c80585ed87a78f76b2f7fb4374183b5ce353d387a6216b8ca9f4d"
+}
+```
+
+Use `verifyEnclaveReceipt` (no method/path required for this shape) and
+optionally pass any of the four strict gates. **Mismatches throw a fatal
+`Error`** — perfect for downstream code that must abort on identity drift.
+
+```js
+const { verifyEnclaveReceipt } = require('@geoclear/verify-receipt');
+
+const verified = await verifyEnclaveReceipt({
+  receipt,                       // the compact JWS string
+  canonicalPayload,              // your decision JSON (or pre-canonicalized Buffer)
+  // pick one key source:
+  //   - default: fetches https://geoclear.io/.well-known/jwks.json
+  //   - jwks: { keys: [...] }            — local JWKS, no network
+  //   - publicKeyJwk: { ... }            — single JWK, no network
+
+  // strict gates (any combination):
+  expectedAccountId:  '769533384420',
+  expectedRegion:     'us-east-1',
+  expectedInstanceId: 'i-095d3b347ed8703e5',
+  expectedPcr0:       '98fc045975c7b9a5...b8ca9f4d',
+});
+
+// verified.signing_account_id, .signing_region, .signing_instance_id, .pcr0
+```
+
+### Why hard-fail on mismatch
+
+If you embed these gates in your audit harness, you're stating in code:
+*"I will only accept a receipt that was signed by **this specific KMS key
+in this specific account on this specific instance running this specific
+.eif**."* A receipt that's signed correctly but by the wrong host throws.
+This is the cryptographic contract that distinguishes "GeoClear says X" from
+"the specific signing-host I have an SBOM for says X."
 
 ## Future language support
 
