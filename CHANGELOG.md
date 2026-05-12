@@ -1,5 +1,9 @@
 # @geoclear/verify-receipt — changelog
 
+## [1.1.1] — 2026-05-12
+
+Metadata-only release. Repository moved from `shaileshjgd/geoclear-verify-receipt` to `geoclear-io/verify-receipt` (org-namespaced under the canonical GeoClear public-protocol-artifact org). GitHub auto-redirects from the old URL; no code changes; no API changes. Existing v1.1.0 callers are unaffected — upgrading to v1.1.1 is optional and metadata-only.
+
 ## [1.1.0] — 2026-05-11
 
 Adds support for fact-witness Nitro Enclave receipts and hardware-attested

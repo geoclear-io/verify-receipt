@@ -1,7 +1,7 @@
 {
   "name": "@geoclear/verify-receipt",
-  "version": "1.1.0",
-  "description": "Verify GeoClear signed decision receipts offline. Proves what GeoClear returned at what moment, without calling GeoClear. v1.1.0 adds hardware-attested identity gates (signing account / region / instance / PCR0).",
+  "version": "1.1.1",
+  "description": "Verify GeoClear signed decision receipts offline. Proves what GeoClear returned at what moment, without calling GeoClear. v1.1.1 — repo metadata moved to geoclear-io org (no API changes).",
   "type": "commonjs",
   "main": "src/verify.js",
   "exports": {
@@ -30,11 +30,11 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/shaileshjgd/geoclear-verify-receipt.git"
+    "url": "git+https://github.com/geoclear-io/verify-receipt.git"
   },
   "homepage": "https://geoclear.io/security#receipt-demo",
   "bugs": {
-    "url": "https://github.com/shaileshjgd/geoclear-verify-receipt/issues"
+    "url": "https://github.com/geoclear-io/verify-receipt/issues"
   },
   "author": "Auduu Inc <hello@geoclear.io>",
   "license": "MIT",
