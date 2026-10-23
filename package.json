@@ -1,53 +1,55 @@
 {
   "name": "@geoclear/verify-receipt",
-  "version": "1.1.1",
-  "description": "Verify GeoClear signed decision receipts offline. Proves what GeoClear returned at what moment, without calling GeoClear. v1.1.1 — repo metadata moved to geoclear-io org (no API changes).",
+  "version": "2.0.0",
+  "description": "Verify GeoClear signed receipts and Evidence Bundles offline, against a JWKS you trust: ES384 signatures, request and response hashes, and the ML-DSA-87 layer of hybrid bundles. Verifies signatures and integrity, never decisions.",
+  "main": "verify.js",
   "type": "commonjs",
-  "main": "src/verify.js",
-  "exports": {
-    ".": {
-      "require": "./src/verify.js",
-      "types": "./src/verify.d.ts"
-    }
+  "engines": {
+    "node": ">=20.19.0"
+  },
+  "bin": {
+    "geoclear-verify-receipt": "cli.js"
   },
   "files": [
-    "src/",
+    "verify.js",
+    "cli.js",
     "README.md",
-    "LICENSE",
-    "CHANGELOG.md"
+    "CHANGELOG.md",
+    "LICENSE"
   ],
   "scripts": {
-    "test": "vitest run"
+    "verify": "node cli.js"
   },
   "keywords": [
     "geoclear",
-    "signed-receipts",
+    "verify-receipt",
     "jws",
-    "ecdsa",
-    "audit-trail",
-    "address-api",
-    "cryptographic-attestation"
+    "ecdsa-p384",
+    "ml-dsa-87",
+    "evidence-bundle"
   ],
+  "capabilities": [
+    "ecdsa-p384",
+    "ml-dsa-87",
+    "hybrid-evidence-bundle",
+    "ecdsa-chain-anchored-mldsa-pubkey-fingerprint-binding",
+    "independent-trust-source",
+    "key-metadata-enforcement",
+    "v5_1-policy-bundle-shape-validation"
+  ],
+  "dependencies": {
+    "jose": "^5.10.0",
+    "@noble/post-quantum": "^0.6.1",
+    "adm-zip": "^0.5.16"
+  },
+  "license": "MIT",
+  "author": "GeoClear, Inc.",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/geoclear-io/verify-receipt.git"
   },
-  "homepage": "https://geoclear.io/security#receipt-demo",
   "bugs": {
     "url": "https://github.com/geoclear-io/verify-receipt/issues"
   },
-  "author": "Auduu Inc <hello@geoclear.io>",
-  "license": "MIT",
-  "engines": {
-    "node": ">=18"
-  },
-  "dependencies": {
-    "jose": "^5.0.0"
-  },
-  "devDependencies": {
-    "vitest": "^2.0.0"
-  },
-  "publishConfig": {
-    "access": "public"
-  }
+  "homepage": "https://github.com/geoclear-io/verify-receipt#readme"
 }
