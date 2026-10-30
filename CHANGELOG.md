@@ -1,5 +1,174 @@
 # Changelog
 
+## 2.0.1 - security fix
+
+2.0.0 was tagged in the public repository on 2026-10-23 but never published to npm; 2.0.1 is the first 2.x release on npm and includes every 2.0.0 change below.
+
+**2.0.1 verifies a bundle only in the ZIP layout GeoClear issues bundles in.** A
+bundle that was unpacked and zipped again, or re-packed by another archive
+tool, is refused with a `ZIP_*` code whenever the result differs from that
+layout. Most tools do differ: they add extra fields, directory entries or
+metadata files, or they reorder the archive. Verify the bundle file as you
+received it from GeoClear.
+
+### Security
+
+- **adm-zip `^0.6.1`** (was `^0.5.16`, which resolves to 0.5.x only). This
+  package reads a bundle with `new AdmZip(bytes)`, `getEntries()`,
+  `getEntry(name)` and the synchronous `entry.getData()`. The advisories that
+  apply to that use, all fixed in 0.6.1:
+  - GHSA-xcpc-8h2w-3j85 (CVE-2026-39244, high): a crafted ZIP that declares a
+    huge uncompressed size forces an allocation of up to 4 GB;
+  - GHSA-7q85-xj36-vmfc (CVE-2026-77301, high): the output buffer is allocated
+    from the declared uncompressed size before the data is checked;
+  - GHSA-rcw4-f5rp-g42v (high): an entry that declares an uncompressed size of
+    0 bypasses the decompression cap;
+  - GHSA-p634-w6r4-rjp2 (medium): with two entries of one name, `getEntry()` and
+    extraction resolve the name to different content.
+
+  The other advisories reported against 0.5.x concern extraction to disk
+  (GHSA-vwc7-r8mq-g2x9, symbolic links at the destination; GHSA-j5f4-cc29-5x44,
+  setuid and setgid bits) or the asynchronous API (GHSA-8238-w5pm-2374,
+  GHSA-c6fg-446q-cg94). This package never extracts a bundle and does not use
+  the asynchronous API.
+- **Every ZIP reader now sees the entries the verifier reads.** adm-zip reads
+  only the central directory the end record points at. A ZIP archive can show
+  other readers (Info-ZIP `unzip`, `bsdtar`, macOS `ditto`, Python's `zipfile`)
+  a different `receipt/receipt.jws` in several ways:
+  - a second central directory;
+  - data before the archive;
+  - a local header naming another file than its central-directory entry;
+  - a local entry the central directory does not list;
+  - a Unicode Path extra field;
+  - a symbolic link.
+
+  An earlier 2.0.1 draft verified the genuine receipt in such bundles while
+  those tools extracted a forged one. Before adm-zip parses anything, the raw
+  bytes are now checked, and the bundle is refused
+  (`ZIP_CONTAINER_NOT_CANONICAL`) unless:
+  - **Overall layout:** the archive is exactly its local entries, then the
+    central directory, then the end record, with nothing before, between or
+    after them;
+  - **End record:** it is the last 22 bytes, with no archive comment, one disk
+    and no ZIP64;
+  - **Local entries:** they start at byte 0, follow one another in
+    central-directory order, and the last ends where the central directory
+    starts, so no two entries share data;
+  - **Headers agree:** each local header repeats its central-directory entry
+    (name bytes, flags, method, CRC and both sizes);
+  - **No extras:** no entry has an extra field (Unicode path, timestamps, ZIP64
+    or any other) or a comment;
+  - **Flags:** they are 0 or UTF-8 names (0x0800) only, so there is no
+    encryption and no data descriptor;
+  - **Version and method:** version needed is at most 2.0, and the method is
+    stored or deflate, a stored entry's two sizes being equal;
+  - **File type:** each entry is made on MS-DOS or Unix and is a plain regular
+    file: no link, directory, device, setuid, setgid or sticky bit, and no
+    MS-DOS attribute other than read-only and archive.
+- **Only the names a GeoClear bundle contains** (`ZIP_ENTRY_NAME_UNKNOWN`).
+  - **The closed set** (exported as `BUNDLE_ENTRY_NAMES`):
+    - the 13 entries of the bundle layout in README.md;
+    - `trust/key-transparency-manifest.json`,
+      `trust/key-transparency-manifest.sig` and `trust/cosign-pubkey.pem`;
+    - `transaction/transaction-manifest.json`, `transaction/consent-blob.json`,
+      `transaction/compliance-snapshot.json` and
+      `transaction/settlement-pairings.json`.
+
+    These are every name GeoClear's bundle writer emits.
+  - **Also refused:** directory entries, other files, Windows 8.3 short names
+    such as `trust/JWKS-S~1.JSO`, and look-alike names.
+- **Duplicate, ambiguous and unsafe names are refused**, before any entry is
+  read and whatever the trust source:
+  - `ZIP_ENTRY_NAME_DUPLICATE`: two entries have the same name, either exactly
+    or after these normalizations:
+    - `\` becomes `/`;
+    - empty and `.` segments are dropped (a leading `./` or `/`);
+    - trailing dots and spaces are dropped from each segment;
+    - Unicode normalization (NFC) and case are ignored.
+
+    A person who extracts such a bundle on a case-insensitive file system sees
+    one file, which need not be the one the verifier read: with adm-zip 0.5.x,
+    the verifier read the copy listed last.
+  - `ZIP_ENTRY_NAME_UNSAFE`: an entry name is any of:
+    - empty or absolute (a leading `/` or `\`, or a colon, as in a drive letter
+      or a Windows stream name);
+    - a path with a `..` segment, or a segment of only dots and spaces;
+    - holding a control, format, line or paragraph separator, or
+      default-ignorable character. That includes the HFS+ ignorables
+      U+206A-U+206F, which an HFS+ volume folds into the name without them.
+
+  Error messages show such characters as `<U+XXXX>`.
+- **Entry sizes.** Each entry the verifier relies on has its own cap, which
+  applies to both the uncompressed and the compressed size; an entry over its
+  cap is refused (`ZIP_ENTRY_TOO_LARGE`). The caps are exported as
+  `BUNDLE_ENTRY_CAPS`, and `MAX_BUNDLE_ENTRY_BYTES` is the largest, 1 MiB. Each
+  is a round value at least 50 times the largest real one seen across
+  GeoClear's bundle writers, the committed test bundles and earlier sample
+  bundles, and never below 64 KiB. The exception is `signature/mldsa.sig`,
+  which is always 4,627 bytes (an ML-DSA-87 signature, FIPS 204) and is capped
+  at 64 KiB, about 14 times that:
+
+  | Entry | Cap | Largest seen |
+  |---|---|---|
+  | `receipt/receipt.jws` | 1 MiB | 947 bytes |
+  | `signature/mldsa-signed-input.bytes` | 1 MiB | 817 bytes (the receipt's signing input) |
+  | `trust/jwks-snapshot.json` | 256 KiB | 3,205 bytes |
+  | `signature/mldsa-pubkey.json` | 256 KiB | 3,901 bytes |
+  | `trust/trust-anchor.txt` | 128 KiB | 1,468 bytes |
+  | `signature/mldsa.sig` | 64 KiB | always 4,627 bytes |
+
+  The receipt's cap also leaves room for the optional `policy_bundle` claim of
+  the receipt schema. None of these entries grows with the response body: the
+  receipt carries the body's hash, and the signing input is the receipt's own
+  header and payload.
+  - **The audit report is read up to 1 MiB, and skipped beyond it.**
+    `audit/verification-report.json` is informational and never used to
+    verify. GeoClear's bundle writer copies the response body into it twice, so
+    it is about 2 to 3.3 times the body; a body above roughly 300 to 500 KB,
+    depending on its shape, gives a report over 1 MiB. Such a report is not
+    decompressed, `parseBundle` reports `verification_report: null` (as for a
+    malformed report), and the bundle verifies on its other entries: the CLI
+    prints its usual `[OK]` lines and `Bundle VALID.`. A damaged report within
+    1 MiB (one that fails its CRC, cannot be decompressed or is not the size it
+    declares) is treated the same way, and is never inflated past the size it
+    declares. Neither its size nor damage to it makes a bundle invalid. The
+    container and name checks still apply to it.
+  - **Size mismatch:** an entry that does not decompress to exactly its
+    declared size is refused when it is read (`ZIP_ENTRY_SIZE_MISMATCH`).
+    adm-zip stops inflating at the declared size, so a longer stream is cut off.
+  - **Damaged data:** an entry that cannot be decompressed (an invalid deflate
+    stream) or does not match its CRC is refused when it is read
+    (`ZIP_ENTRY_DATA_CORRUPT`). The verifier checks every entry's CRC itself,
+    including an empty one, which the ZIP library returns without checking.
+    The message names the entry; the ZIP library's own message, which can name
+    a different entry, is not passed on.
+  - **Total:** reading decompresses at most 3,776 KiB (about 3.7 MiB), the
+    sum of the caps.
+  - **Memory depends on content.** The verifier parses the receipt's payload
+    and three entries (snapshot, report, ML-DSA descriptor) as JSON, so memory
+    also depends on what they contain. Peak resident memory of one
+    `verifyBundle` call, measured with `/usr/bin/time -l` in a fresh process on
+    macOS (arm64):
+
+    | Bundle | Node 20.20.2 | Node 22.22.0 |
+    |---|---|---|
+    | a GeoClear bundle | 54 MiB | 59 MiB |
+    | a valid bundle with every read entry at its cap, deflated | 75 MiB | 80 MiB |
+    | the same, stored | 76 MiB | 81 MiB |
+    | the same, with the JSON made of empty objects (`{},{},...`), deflated or stored | 158 MiB | 165 MiB |
+    | a bundle whose report is a deflate stream of 1 GiB (skipped, never inflated) | 52 MiB | 55 MiB |
+
+    The empty-object shape is the worst shape tried, not a proven ceiling.
+  - Entries the verifier does not read are never decompressed and are not
+    capped.
+- **A bundle without a receipt** (no `receipt/receipt.jws`, or an empty one) is
+  refused with `BUNDLE_RECEIPT_MISSING`; 2.0.0 threw an uncoded error.
+
+These refusals carry a `.code` and no `.step`; the CLI exits 4 and prints the
+code. Input that is not a ZIP archive, which 2.0.0 refused with adm-zip's own
+uncoded error, is now refused with `ZIP_CONTAINER_NOT_CANONICAL`. Everything
+else is unchanged.
+
 ## 2.0.0 - security fix, breaking
 
 A bundle could vouch for itself. In 1.x, `verifyBundle({ zip })` verified a

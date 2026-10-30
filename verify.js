@@ -26,10 +26,25 @@
  *   key must be EC P-384; a bundle's ML-DSA layer must declare ML-DSA-87 (and a
  *   signed pqc_alg claim, when present, must say the same).
  *
+ * v2.0.1 (security fix): adm-zip ^0.6.1, and a bundle is read only when its
+ * ZIP container has the one unambiguous layout GeoClear issues it in, so that
+ * every ZIP reader sees the entries the verifier reads. Before any entry is
+ * read, a bundle is refused when its container is not in that layout
+ * (ZIP_CONTAINER_NOT_CANONICAL), an entry name is unsafe (ZIP_ENTRY_NAME_UNSAFE),
+ * two names are one file once extracted (ZIP_ENTRY_NAME_DUPLICATE), a name is
+ * not one a bundle contains (ZIP_ENTRY_NAME_UNKNOWN), or an entry the verifier
+ * reads is too large (ZIP_ENTRY_TOO_LARGE); an entry that does not decompress
+ * to its declared size (ZIP_ENTRY_SIZE_MISMATCH), or cannot be decompressed or
+ * fails its CRC (ZIP_ENTRY_DATA_CORRUPT), is refused when read. The
+ * informational audit report is the exception: too large or damaged, it is
+ * reported as null and never refuses the bundle. A bundle without a receipt is
+ * refused with BUNDLE_RECEIPT_MISSING.
+ *
  * Errors carry `.code` (stable, listed in README.md) and `.step`.
  */
 
 const crypto = require('crypto');
+const zlib = require('zlib');
 
 const DEFAULT_ISS = 'https://geoclear.io';
 const DEFAULT_JWKS_URL = 'https://geoclear.io/.well-known/jwks.json';
@@ -317,11 +332,344 @@ function b64ToBuffer(b64) {
   return Buffer.from(s, 'base64');
 }
 
+// ─── The bundle's ZIP container (v2.0.1) ─────────────────────────────────────
+//
+// A ZIP archive can show different readers different files: a second central
+// directory, data before the archive, a local header whose name differs from
+// the central directory's, a local entry the central directory does not list,
+// a Unicode-path extra field, a symbolic link, or names that one file system
+// folds together. The verifier reads entries through adm-zip, which sees only
+// the central directory the end record points at, so a bundle is read only
+// when its container has one unambiguous layout, checked on the raw bytes
+// before adm-zip parses anything. Refusals are fail-closed, carry a stable
+// code and no step, and are raised before any verification step:
+//
+//   ZIP_CONTAINER_NOT_CANONICAL: the archive is not exactly
+//     [local entry 1 .. local entry N][central directory][end record]
+//     with nothing before, between or after: the end record is the last 22
+//     bytes (no archive comment), one disk, no ZIP64; the central directory
+//     fills the bytes between its offset and the end record; local headers
+//     start at byte 0, follow one another in central-directory order, and the
+//     last one's data ends where the central directory starts; each local
+//     header repeats its central-directory entry (name bytes, flags, method,
+//     CRC, both sizes); no entry has an extra field or a comment; flags are
+//     0 or 0x0800 (UTF-8 names) only, so no encryption and no data
+//     descriptor; version needed is at most 2.0; methods are 0 (stored) and 8
+//     (deflate) only, and a stored entry's two sizes are equal; entries are
+//     made on MS-DOS (0) or Unix (3) only; an entry's Unix mode is a plain
+//     regular file or carries permissions only (no link, directory, device,
+//     setuid, setgid or sticky bit), and its MS-DOS attributes are at most
+//     read-only and archive.
+//   ZIP_ENTRY_NAME_UNSAFE: a name is empty or absolute (a leading "/" or "\",
+//     or a colon, as in a drive letter or a Windows stream name), has a ".."
+//     segment or a segment of only dots and spaces, or holds a control,
+//     format, line or paragraph separator, or default-ignorable character.
+//   ZIP_ENTRY_NAME_DUPLICATE: two names are the same, exactly or once "\"
+//     becomes "/", empty and "." segments are dropped, trailing dots and
+//     spaces are dropped from each segment, and Unicode normalization (NFC)
+//     and case are ignored.
+//   ZIP_ENTRY_NAME_UNKNOWN: a name is not one of BUNDLE_ENTRY_NAMES, the
+//     closed set of names a GeoClear Evidence Bundle can contain (this also
+//     refuses directory entries, Windows 8.3 short names and look-alikes).
+//   ZIP_ENTRY_TOO_LARGE: an entry the verifier reads declares more than its
+//     cap in BUNDLE_ENTRY_CAPS, uncompressed or compressed. The one exception
+//     is audit/verification-report.json: it is informational and never used to
+//     verify, so a report over its cap is skipped (never decompressed, and
+//     reported as null, as a malformed one is), never a reason to refuse.
+//   ZIP_ENTRY_SIZE_MISMATCH: an entry the verifier reads does not decompress
+//     to exactly the size it declares (adm-zip stops inflating at the
+//     declared size, so a longer stream is cut off and refused).
+//   ZIP_ENTRY_DATA_CORRUPT: an entry the verifier reads cannot be
+//     decompressed (an invalid deflate stream) or does not match its CRC. The
+//     entry is named; the ZIP library's own message is never passed on.
+//   The audit report is the exception to the last three: it is informational,
+//   so a report that is over its limit, damaged or of the wrong size is
+//   reported as null and the bundle is verified on its other entries.
+//   BUNDLE_RECEIPT_MISSING: the bundle has no receipt/receipt.jws, or it is
+//     empty. No step: nothing has been verified yet.
+//
+// The same check runs first in parseBundle and so in verifyBundle. Every
+// bundle GeoClear's bundle writer (buildEvidenceBundle) produces has this
+// layout: stored entries, flags 0, no extra fields, written in order.
+
+/**
+ * The most each entry the verifier reads may declare, uncompressed and
+ * compressed. Each is a round value at least 50 times the largest real one
+ * seen across GeoClear's bundle writers, the committed fixtures and the
+ * historical sample bundles, and never below 64 KiB, except mldsa.sig, which
+ * is fixed at 4,627 bytes (an ML-DSA-87 signature, FIPS 204) and capped at
+ * 64 KiB, about 14 times that:
+ *   receipt/receipt.jws           1 MiB    largest seen 947 bytes; also leaves
+ *                                          room for the optional policy_bundle
+ *                                          claim of the v5.1 receipt schema
+ *   signature/mldsa-signed-input  1 MiB    the receipt's JWS signing input
+ *                                          (largest seen 817 bytes)
+ *   trust/jwks-snapshot.json      256 KiB  largest seen 3,205 bytes
+ *   signature/mldsa-pubkey.json   256 KiB  largest seen 3,901 bytes
+ *   trust/trust-anchor.txt        128 KiB  largest seen 1,468 bytes
+ *   signature/mldsa.sig           64 KiB   always 4,627 bytes
+ *   audit/verification-report     1 MiB    a read limit, not a refusal: see below
+ * None of the others grows with the response body: the receipt carries the body's
+ * hash, not the body, and the signing input is the receipt's own header and
+ * payload. The audit report does grow: the bundle writer copies the body into
+ * it twice (pretty-printed and in canonical form), so for a large body it is
+ * about 2 to 3.3 times the body, depending on the body's shape, and nothing
+ * upstream limits the body. A report is therefore read only up to 1 MiB; a
+ * larger one is skipped (not decompressed; verification_report is null),
+ * never a reason to refuse the bundle.
+ */
+const BUNDLE_ENTRY_CAPS = Object.freeze({
+  'receipt/receipt.jws': 1024 * 1024,
+  'trust/jwks-snapshot.json': 256 * 1024,
+  'trust/trust-anchor.txt': 128 * 1024,
+  'audit/verification-report.json': 1024 * 1024,
+  'signature/mldsa.sig': 64 * 1024,
+  'signature/mldsa-pubkey.json': 256 * 1024,
+  'signature/mldsa-signed-input.bytes': 1024 * 1024,
+});
+
+/** The largest of the per-entry caps (1 MiB); each entry's own cap is in BUNDLE_ENTRY_CAPS. */
+const MAX_BUNDLE_ENTRY_BYTES = Math.max(...Object.values(BUNDLE_ENTRY_CAPS));
+
+/**
+ * Every name a GeoClear Evidence Bundle can contain: the 13 of the bundle
+ * layout (README.md), and the files the bundle writer adds when it has them
+ * (the key-transparency manifest and its signature, the cosign public key,
+ * and the four transaction files). A bundle holds no directory entries.
+ */
+const BUNDLE_ENTRY_NAMES = Object.freeze([
+  'README.md',
+  'receipt/receipt.jws',
+  'payload/canonical-payload.bytes',
+  'payload/canonical-payload.json',
+  'payload/canonical-payload.sha256',
+  'signature/mldsa.sig',
+  'signature/mldsa-pubkey.json',
+  'signature/mldsa-signed-input.bytes',
+  'trust/jwks-snapshot.json',
+  'trust/key-fingerprint.txt',
+  'trust/trust-anchor.txt',
+  'trust/key-transparency-manifest.json',
+  'trust/key-transparency-manifest.sig',
+  'trust/cosign-pubkey.pem',
+  'verify/offline-verifier.html',
+  'audit/verification-report.json',
+  'transaction/transaction-manifest.json',
+  'transaction/consent-blob.json',
+  'transaction/compliance-snapshot.json',
+  'transaction/settlement-pairings.json',
+]);
+const BUNDLE_ENTRY_NAME_SET = new Set(BUNDLE_ENTRY_NAMES);
+
+/** The entries parseBundle reads; no other entry is ever decompressed. */
+const BUNDLE_ENTRIES_READ = Object.freeze(Object.keys(BUNDLE_ENTRY_CAPS));
+
+/** The informational audit report: skipped, not refused, when over its cap. */
+const REPORT_ENTRY = 'audit/verification-report.json';
+
+/** zlib errors that mean an entry's deflate stream is invalid. */
+const ZLIB_DATA_ERRORS = new Set(['Z_DATA_ERROR', 'Z_BUF_ERROR', 'Z_STREAM_ERROR', 'Z_NEED_DICT']);
+
+const UNSAFE_NAME_CHAR = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}\p{Default_Ignorable_Code_Point}]/u;
+
+const ZIP_RECOURSE = 'GeoClear issues every bundle in this one layout, and a bundle re-packed by another archive tool is refused: verify the bundle file as you received it';
+
+/** A name as printable ASCII: every other character is shown as <U+XXXX>. */
+function showName(name) {
+  let out = '';
+  for (const ch of String(name)) {
+    const cp = ch.codePointAt(0);
+    out += cp >= 0x20 && cp < 0x7f ? ch : `<U+${cp.toString(16).toUpperCase().padStart(4, '0')}>`;
+  }
+  return JSON.stringify(out);
+}
+
+const notCanonical = (why) => new VerifyError('ZIP_CONTAINER_NOT_CANONICAL', `the bundle's ZIP container ${why}. ${ZIP_RECOURSE}`);
+
+/**
+ * The entries of a bundle whose ZIP container has the one canonical layout
+ * described above, read from the raw bytes; throws ZIP_CONTAINER_NOT_CANONICAL
+ * otherwise. Returns [{ name (Buffer), method, csize, size }] in order.
+ */
+function readCanonicalContainer(buf) {
+  const n = buf.length;
+  if (n < 22) throw notCanonical('is too short to be a ZIP archive');
+  const eocd = n - 22;
+  if (buf.readUInt32LE(eocd) !== 0x06054b50) throw notCanonical('does not end with a ZIP end record (data after the archive, an archive comment, or not a ZIP archive)');
+  if (buf.readUInt16LE(eocd + 20) !== 0) throw notCanonical('has an archive comment');
+  if (buf.readUInt16LE(eocd + 4) !== 0 || buf.readUInt16LE(eocd + 6) !== 0) throw notCanonical('spans more than one disk');
+  const count = buf.readUInt16LE(eocd + 10);
+  const cdSize = buf.readUInt32LE(eocd + 12);
+  const cdOff = buf.readUInt32LE(eocd + 16);
+  if (buf.readUInt16LE(eocd + 8) !== count) throw notCanonical('declares two different entry counts');
+  if (count === 0xffff || cdSize === 0xffffffff || cdOff === 0xffffffff) throw notCanonical('uses ZIP64');
+  if (count === 0) throw notCanonical('has no entries');
+  if (cdOff + cdSize !== eocd) throw notCanonical('has data between the central directory and the end record, or a central directory that is not where the end record says');
+
+  const entries = [];
+  let p = cdOff;
+  for (let k = 0; k < count; k++) {
+    if (p + 46 > eocd || buf.readUInt32LE(p) !== 0x02014b50) throw notCanonical('has a malformed central directory');
+    const madeBy = buf.readUInt16LE(p + 4);
+    const e = {
+      host: madeBy >> 8,
+      need: buf.readUInt16LE(p + 6),
+      flags: buf.readUInt16LE(p + 8),
+      method: buf.readUInt16LE(p + 10),
+      crc: buf.readUInt32LE(p + 16),
+      csize: buf.readUInt32LE(p + 20),
+      size: buf.readUInt32LE(p + 24),
+      nlen: buf.readUInt16LE(p + 28),
+      xlen: buf.readUInt16LE(p + 30),
+      clen: buf.readUInt16LE(p + 32),
+      disk: buf.readUInt16LE(p + 34),
+      attr: buf.readUInt32LE(p + 38),
+      off: buf.readUInt32LE(p + 42),
+    };
+    if (p + 46 + e.nlen + e.xlen + e.clen > eocd) throw notCanonical('has a malformed central directory');
+    e.name = buf.subarray(p + 46, p + 46 + e.nlen);
+    p += 46 + e.nlen + e.xlen + e.clen;
+    if (e.xlen !== 0) throw notCanonical('has an entry with an extra field (such as a Unicode path, a timestamp or ZIP64 sizes), which other readers can use instead of the header');
+    if (e.clen !== 0) throw notCanonical('has an entry comment');
+    if (e.disk !== 0) throw notCanonical('spans more than one disk');
+    if (e.flags !== 0 && e.flags !== 0x0800) throw notCanonical('has an entry with flags other than UTF-8 names (encryption, a data descriptor or other options)');
+    if (e.need > 20) throw notCanonical('has an entry that needs a ZIP feature beyond version 2.0');
+    if (e.method !== 0 && e.method !== 8) throw notCanonical(`has an entry compressed with method ${e.method}; only stored (0) and deflate (8) are read`);
+    if (e.csize === 0xffffffff || e.size === 0xffffffff || e.off === 0xffffffff) throw notCanonical('uses ZIP64');
+    if (e.method === 0 && e.csize !== e.size) throw notCanonical('has a stored entry whose stored and declared sizes differ');
+    if (e.host !== 0 && e.host !== 3) throw notCanonical(`has an entry made on host system ${e.host}; only MS-DOS (0) and Unix (3) entries are read`);
+    const mode = e.attr >>> 16; // Unix mode; a file type of 0 (permissions only, as Python's zipfile writes) is a regular file
+    const type = mode & 0o170000;
+    if ((type !== 0 && type !== 0o100000) || (mode & 0o7000) !== 0) {
+      throw notCanonical('has an entry that is not a plain regular file (a symbolic link, a directory, a device, or a setuid, setgid or sticky file)');
+    }
+    if ((e.attr & 0xffff & ~0x21) !== 0) throw notCanonical('has an entry with MS-DOS attributes other than read-only and archive (a directory, or a system or hidden file)');
+    entries.push(e);
+  }
+  if (p !== eocd) throw notCanonical('has data after the central directory');
+
+  // The local entries: in central-directory order, the first at byte 0, each
+  // right after the one before, the last ending where the central directory starts.
+  let at = 0;
+  for (const e of entries) {
+    if (e.off !== at) throw notCanonical('has data before the first entry, between entries, a local entry the central directory does not list, or entries out of order or sharing data');
+    if (at + 30 > cdOff || buf.readUInt32LE(at) !== 0x04034b50) throw notCanonical('has a malformed local header');
+    const lnlen = buf.readUInt16LE(at + 26);
+    const lxlen = buf.readUInt16LE(at + 28);
+    if (buf.readUInt16LE(at + 4) > 20
+      || buf.readUInt16LE(at + 6) !== e.flags || buf.readUInt16LE(at + 8) !== e.method
+      || buf.readUInt32LE(at + 14) !== e.crc || buf.readUInt32LE(at + 18) !== e.csize || buf.readUInt32LE(at + 22) !== e.size) {
+      throw notCanonical('has a local header that disagrees with its central-directory entry');
+    }
+    if (lnlen !== e.nlen || at + 30 + lnlen > cdOff || !buf.subarray(at + 30, at + 30 + lnlen).equals(e.name)) {
+      throw notCanonical('has a local header whose name differs from its central-directory name');
+    }
+    if (lxlen !== 0) throw notCanonical('has an entry with an extra field (such as a Unicode path, a timestamp or ZIP64 sizes), which other readers can use instead of the header');
+    at += 30 + lnlen + e.csize;
+    if (at > cdOff) throw notCanonical('has an entry that runs into the central directory');
+  }
+  if (at !== cdOff) throw notCanonical('has data between the last entry and the central directory');
+  return entries.map(e => ({ name: e.name, method: e.method, csize: e.csize, size: e.size, crc: e.crc }));
+}
+
+/** Why an entry name is unsafe, or null. */
+function entryNameProblem(name) {
+  if (typeof name !== 'string' || name.length === 0) return 'has no name';
+  if (UNSAFE_NAME_CHAR.test(name)) return 'holds a control, format, separator or default-ignorable (invisible) character';
+  const n = name.replace(/\\/g, '/');
+  if (n.startsWith('/')) return 'is an absolute path';
+  if (n.includes(':')) return 'holds a colon (a drive letter or a stream name)';
+  if (n.split('/').some(seg => seg !== '.' && /^[. ]+$/.test(seg))) return 'has a ".." segment, or a segment of only dots and spaces';
+  return null;
+}
+
+/** The name as one file once extracted: two entries with the same key are one file. */
+function entryNameKey(name) {
+  return name.replace(/\\/g, '/').split('/')
+    .filter(seg => seg !== '' && seg !== '.')
+    .map(seg => seg.replace(/[. ]+$/, ''))
+    .join('/')
+    .normalize('NFC').toUpperCase().toLowerCase();
+}
+
+/**
+ * Refuses a bundle whose container is not canonical, whose entry names are
+ * unsafe, ambiguous or not a bundle's, or whose read entries are too large;
+ * all before any entry is read. Returns the declared size of each entry.
+ */
+function checkBundleContainer(buf) {
+  const entries = readCanonicalContainer(buf);
+  const names = entries.map(e => e.name.toString('utf8'));
+  for (const name of names) {
+    const problem = entryNameProblem(name);
+    if (problem) throw new VerifyError('ZIP_ENTRY_NAME_UNSAFE', `the bundle entry ${showName(name)} ${problem}`);
+  }
+  const seen = new Map();
+  for (const name of names) {
+    const key = entryNameKey(name);
+    if (seen.has(key)) {
+      throw new VerifyError('ZIP_ENTRY_NAME_DUPLICATE', `the bundle entries ${showName(seen.get(key))} and ${showName(name)} are one file once extracted`);
+    }
+    seen.set(key, name);
+  }
+  for (const name of names) {
+    if (!BUNDLE_ENTRY_NAME_SET.has(name)) {
+      throw new VerifyError('ZIP_ENTRY_NAME_UNKNOWN', `the bundle entry ${showName(name)} is not a name a GeoClear Evidence Bundle contains. ${ZIP_RECOURSE}`);
+    }
+  }
+  const declared = new Map();
+  entries.forEach((e, i) => declared.set(names[i], e));
+  const skipped = new Set();
+  for (const name of BUNDLE_ENTRIES_READ) {
+    const e = declared.get(name);
+    const cap = BUNDLE_ENTRY_CAPS[name];
+    if (e && (e.size > cap || e.csize > cap)) {
+      // The informational report is skipped, not refused: it is never used to verify.
+      if (name === REPORT_ENTRY) { skipped.add(name); continue; }
+      throw new VerifyError('ZIP_ENTRY_TOO_LARGE', `${name} declares ${e.size} bytes (${e.csize} compressed); the verifier reads at most ${cap} for this entry`);
+    }
+  }
+  return { names, declared, skipped };
+}
+
 function parseBundle(zipBytes) {
-  const zip = new AdmZip(Buffer.isBuffer(zipBytes) ? zipBytes : Buffer.from(zipBytes));
+  const buf = Buffer.isBuffer(zipBytes) ? zipBytes : Buffer.from(zipBytes);
+  const { names, declared, skipped } = checkBundleContainer(buf);
+  const zip = new AdmZip(buf);
+  // The canonical layout leaves adm-zip one reading; confirm it lists the same entries.
+  const listed = zip.getEntries().map(e => e.entryName);
+  if (listed.length !== names.length || listed.some((name, i) => name !== names[i])) {
+    throw notCanonical('is read differently by the ZIP library');
+  }
   const read = name => {
+    if (skipped.has(name)) return null; // over its cap and informational: never decompressed
     const e = zip.getEntry(name);
-    return e ? e.getData() : null;
+    if (!e) return null;
+    const size = declared.get(name).size;
+    let data;
+    try {
+      data = e.getData();
+    } catch (err) {
+      // adm-zip stops inflating at the declared size (zlib's maxOutputLength).
+      if (err && err.code === 'ERR_BUFFER_TOO_LARGE') {
+        throw new VerifyError('ZIP_ENTRY_SIZE_MISMATCH', `${name} inflates to more than the ${size} bytes it declares`);
+      }
+      // A CRC failure (adm-zip) or an invalid deflate stream (zlib). adm-zip's
+      // message can name another entry, so it is not passed on.
+      if (err && (ZLIB_DATA_ERRORS.has(err.code) || /^ADM-ZIP: CRC32 checksum failed/.test(String(err.message)))) {
+        throw new VerifyError('ZIP_ENTRY_DATA_CORRUPT', `${name} cannot be decompressed or does not match its CRC`);
+      }
+      throw err;
+    }
+    if (data.length !== size) {
+      throw new VerifyError('ZIP_ENTRY_SIZE_MISMATCH', `${name} holds ${data.length} bytes, not the ${size} it declares`);
+    }
+    // The CRC is checked here as well: adm-zip returns an entry with no stored
+    // bytes as empty without checking its CRC.
+    if ((zlib.crc32(data) >>> 0) !== declared.get(name).crc) {
+      throw new VerifyError('ZIP_ENTRY_DATA_CORRUPT', `${name} cannot be decompressed or does not match its CRC`);
+    }
+    return data;
   };
   const readStr = name => {
     const b = read(name);
@@ -329,14 +677,19 @@ function parseBundle(zipBytes) {
   };
 
   const receiptJws = readStr('receipt/receipt.jws');
-  if (!receiptJws) throw new Error('Bundle missing receipt/receipt.jws — not a GeoClear Evidence Bundle');
+  if (!receiptJws) throw new VerifyError('BUNDLE_RECEIPT_MISSING', 'the bundle has no receipt/receipt.jws, or it is empty: not a GeoClear Evidence Bundle');
   const trustJwksBytes = read('trust/jwks-snapshot.json');
   const trustJwks = trustJwksBytes ? trustJwksBytes.toString('utf8') : '';
   const trustAnchor = readStr('trust/trust-anchor.txt') || '';
   // audit/verification-report.json is informational and never used to verify;
-  // a malformed one is reported as null rather than failing the bundle.
+  // a malformed one, or one over its 1 MiB cap (skipped, never decompressed),
+  // is reported as null rather than failing the bundle.
+  // Damage to it is not a reason to refuse either: a CRC failure, an invalid
+  // deflate stream or a wrong size gives null. It is still never inflated past
+  // the size it declares, which is at most 1 MiB.
   const verificationReport = (() => {
-    const s = readStr('audit/verification-report.json');
+    let s;
+    try { s = readStr(REPORT_ENTRY); } catch (_e) { return null; }
     if (!s) return null;
     try { return JSON.parse(s); } catch (_e) { return null; }
   })();
@@ -823,6 +1176,10 @@ module.exports = {
   parseBundle,
   sha384Hex,
   b64ToBuffer,
+  // v2.0.1: the per-entry size caps (and the largest of them) and the closed set of entry names
+  BUNDLE_ENTRY_CAPS,
+  MAX_BUNDLE_ENTRY_BYTES,
+  BUNDLE_ENTRY_NAMES,
   // v2.0.0: trust model helpers
   VerifyError,
   parseTrustAnchor,

@@ -1,6 +1,6 @@
 {
   "name": "@geoclear/verify-receipt",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "description": "Verify GeoClear signed receipts and Evidence Bundles offline, against a JWKS you trust: ES384 signatures, request and response hashes, and the ML-DSA-87 layer of hybrid bundles. Verifies signatures and integrity, never decisions.",
   "main": "verify.js",
   "type": "commonjs",
@@ -40,7 +40,7 @@
   "dependencies": {
     "jose": "^5.10.0",
     "@noble/post-quantum": "^0.6.1",
-    "adm-zip": "^0.5.16"
+    "adm-zip": "^0.6.1"
   },
   "license": "MIT",
   "author": "GeoClear, Inc.",

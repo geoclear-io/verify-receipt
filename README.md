@@ -280,9 +280,9 @@ the issuer and the issue time. It prints no claim that describes a decision.
 | 1 | the receipt's signature does not verify with the trusted key (the receipt was modified, or signed by another key); for a single receipt, also a request or response that differs from what it covers | `ECDSA_VERIFY_FAILED`, `REQUEST_HASH_MISMATCH`, `RESPONSE_HASH_MISMATCH` |
 | 2 | the ML-DSA-87 public key in the bundle is not the one the signed receipt names (key swap) | `ECDSA_CHAIN_FINGERPRINT_MISMATCH`, `ECDSA_CHAIN_ANCHOR_MISSING` |
 | 3 | the ML-DSA-87 signature does not verify, is not over the receipt's signed bytes, or the bundle names another ML-DSA algorithm | `ML_DSA_SIGNATURE_INVALID`, `ML_DSA_SIGNED_INPUT_MISMATCH`, `ML_DSA_VERIFY_THREW`, `ML_DSA_ALG_UNSUPPORTED` |
-| 4 | the bundle, or a `--request-body` / `--response-body` file, is missing or cannot be read | |
+| 4 | the bundle, or a `--request-body` / `--response-body` file, is missing or cannot be read; or the bundle is not in the ZIP layout GeoClear issues, has an unsafe, duplicate or unknown entry name, or an entry the verifier relies on that is larger than it reads, not the size it declares, or damaged (cannot be decompressed or fails its CRC); or the bundle has no receipt | `ZIP_CONTAINER_NOT_CANONICAL`, `ZIP_ENTRY_NAME_UNSAFE`, `ZIP_ENTRY_NAME_DUPLICATE`, `ZIP_ENTRY_NAME_UNKNOWN`, `ZIP_ENTRY_TOO_LARGE`, `ZIP_ENTRY_SIZE_MISMATCH`, `ZIP_ENTRY_DATA_CORRUPT`, `BUNDLE_RECEIPT_MISSING` |
 | 5 | CLI usage error | |
-| 6 | trust refused: no independent trust source (`--offline` without `--jwks`), key not trusted, key metadata missing, a malformed receipt header, or the receipt's claims disagree with the key | `TRUST_SOURCE_REQUIRED`, `KID_NOT_TRUSTED`, `KEY_*`, `RECEIPT_MALFORMED`, `CLAIM_*`, `ENDPOINT_*`, `BUNDLE_*` |
+| 6 | trust refused: no independent trust source (`--offline` without `--jwks`), key not trusted, key metadata missing, a malformed receipt header, or the receipt's claims disagree with the key | `TRUST_SOURCE_REQUIRED`, `KID_NOT_TRUSTED`, `KEY_*`, `RECEIPT_MALFORMED`, `CLAIM_*`, `ENDPOINT_*`, `BUNDLE_SNAPSHOT_KEY_MISMATCH`, `BUNDLE_TRUST_ANCHOR_MISMATCH` |
 | 7 | trust source unreadable: the `--jwks` file is missing, unreadable or not a JWKS, or the live JWKS cannot be fetched or is not https | `TRUST_SOURCE_UNREADABLE`, `TRUST_SOURCE_INVALID`, `TRUST_SOURCE_UNAVAILABLE`, `TRUST_SOURCE_NOT_HTTPS` |
 
 Three ways to see tamper detection on a bundle you hold:
@@ -319,10 +319,44 @@ evidence-bundle.zip
 ├── verify/
 │   └── offline-verifier.html
 └── audit/
-    └── verification-report.json ← informational; not used to verify (a malformed one is ignored)
+    └── verification-report.json ← informational; not used to verify (a malformed or damaged one, or one over 1 MiB, is ignored)
 ```
 
 A bundle without the `signature/` files is verified in `ecdsa-only` mode.
+
+**Verify the bundle file as you received it.** From 2.0.1, a bundle is verified only in the ZIP
+layout GeoClear issues it in. That layout is the entries above, each a plain stored or deflated file,
+with no extra fields, comments or directory entries, written in order and followed by the central
+directory and the end record, with nothing else. This means every ZIP tool sees the same files the
+verifier reads. Besides the 13 entries above, a bundle can carry these, when GeoClear included them:
+`trust/key-transparency-manifest.json`, `trust/key-transparency-manifest.sig`,
+`trust/cosign-pubkey.pem` and the four `transaction/` files (`BUNDLE_ENTRY_NAMES` lists all 20).
+A bundle that was unzipped and zipped again, or re-packed by another archive tool, is refused
+whenever the result differs from that layout, and most tools' results do (CLI exit 4, codes below).
+
+Each entry the verifier relies on also has a size cap (`BUNDLE_ENTRY_CAPS`), which applies to both the
+uncompressed and the compressed size. Each cap is at least 50 times the largest GeoClear has produced,
+except `signature/mldsa.sig`, which is always 4,627 bytes (an ML-DSA-87 signature) and is capped at
+64 KiB, about 14 times that:
+
+| Entry | Cap |
+|---|---|
+| `receipt/receipt.jws`, `signature/mldsa-signed-input.bytes` | 1 MiB |
+| `trust/jwks-snapshot.json`, `signature/mldsa-pubkey.json` | 256 KiB |
+| `trust/trust-anchor.txt` | 128 KiB |
+| `signature/mldsa.sig` | 64 KiB |
+
+An entry over its cap is refused (`ZIP_ENTRY_TOO_LARGE`), as is one that does not decompress to the size
+it declares (`ZIP_ENTRY_SIZE_MISMATCH`), or one that cannot be decompressed or fails its CRC
+(`ZIP_ENTRY_DATA_CORRUPT`; the message names the entry). The basis for each cap is in
+[CHANGELOG.md](CHANGELOG.md).
+
+`audit/verification-report.json` is read only up to 1 MiB. It is informational and never used to
+verify, and it grows with the response body: GeoClear copies the body into it twice. A report over
+1 MiB is skipped, not decompressed, and the bundle verifies on its other entries. So does a damaged
+report within 1 MiB (one that fails its CRC, cannot be decompressed or is not the size it declares): it
+is never inflated past the size it declares. In both cases the CLI prints its usual `[OK]` lines and
+`Bundle VALID.`, and `parseBundle` returns `verification_report: null`, as for a malformed report.
 
 ### Programmatic API
 
@@ -338,7 +372,15 @@ if (result.mode === 'hybrid-ecdsa-p384-mldsa-87') {
 }
 ```
 
-On failure, `verifyBundle()` throws an Error with a specific `.code` and
-`.step` (`ECDSA_VERIFY_FAILED`, `ECDSA_CHAIN_FINGERPRINT_MISMATCH`,
-`ML_DSA_SIGNATURE_INVALID`, `ML_DSA_SIGNED_INPUT_MISMATCH`, `ML_DSA_VERIFY_THREW`, and the trust codes in
-[CHANGELOG.md](CHANGELOG.md)) so callers can tell the failure modes apart.
+On failure, `verifyBundle()` throws an Error with a specific `.code`, so callers can tell the
+failure modes apart:
+
+- **Verification-step failures** also carry the `.step` that failed: `ECDSA_VERIFY_FAILED`,
+  `ECDSA_CHAIN_FINGERPRINT_MISMATCH`, `ML_DSA_SIGNATURE_INVALID`,
+  `ML_DSA_SIGNED_INPUT_MISMATCH`, `ML_DSA_VERIFY_THREW`, and the trust codes in
+  [CHANGELOG.md](CHANGELOG.md).
+- **The bundle's container and entries** are checked before any step, and those refusals carry
+  no `.step`: `ZIP_CONTAINER_NOT_CANONICAL`, `ZIP_ENTRY_NAME_UNSAFE`,
+  `ZIP_ENTRY_NAME_DUPLICATE`, `ZIP_ENTRY_NAME_UNKNOWN`, `ZIP_ENTRY_TOO_LARGE`,
+  `ZIP_ENTRY_SIZE_MISMATCH`, `ZIP_ENTRY_DATA_CORRUPT` and `BUNDLE_RECEIPT_MISSING` (no
+  `receipt/receipt.jws`, or an empty one).
